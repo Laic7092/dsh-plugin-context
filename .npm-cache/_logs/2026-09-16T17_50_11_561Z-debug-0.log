@@ -1,0 +1,18 @@
+0 verbose cli /home/laix/.vite-plus/js_runtime/node/24.21.0/bin/node /home/laix/.vite-plus/js_runtime/node/24.21.0/bin/npm
+1 info using npm@11.19.0
+2 info using node@v24.21.0
+3 silly config load:file:/home/laix/.vite-plus/js_runtime/node/24.21.0/lib/node_modules/npm/npmrc
+4 silly config load:file:/home/laix/dsh/dsh-plugin-context/.npmrc
+5 silly config load:file:/home/laix/.npmrc
+6 silly config load:file:/home/laix/.vite-plus/js_runtime/node/24.21.0/etc/npmrc
+7 verbose title npm run build
+8 verbose argv "run" "build"
+9 verbose logfile logs-max:10 dir:/home/laix/dsh/dsh-plugin-context/.npm-cache/_logs/2026-09-16T17_50_11_561Z-
+10 verbose logfile /home/laix/dsh/dsh-plugin-context/.npm-cache/_logs/2026-09-16T17_50_11_561Z-debug-0.log
+11 silly logfile done cleaning log files
+12 verbose cwd /home/laix/dsh/dsh-plugin-context
+13 verbose os Linux 6.6.114.1-microsoft-standard-WSL2
+14 verbose node v24.21.0
+15 verbose npm  v11.19.0
+16 verbose exit 2
+17 verbose code 2

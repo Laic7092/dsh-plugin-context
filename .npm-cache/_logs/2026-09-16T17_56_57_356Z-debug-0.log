@@ -1,0 +1,44 @@
+0 verbose cli /home/laix/.vite-plus/js_runtime/node/24.21.0/bin/node /home/laix/.vite-plus/js_runtime/node/24.21.0/bin/npm
+1 info using npm@11.19.0
+2 info using node@v24.21.0
+3 silly config load:file:/home/laix/.vite-plus/js_runtime/node/24.21.0/lib/node_modules/npm/npmrc
+4 silly config load:file:/home/laix/dsh/dsh-plugin-context/.npmrc
+5 silly config load:file:/home/laix/.npmrc
+6 silly config load:file:/home/laix/.vite-plus/js_runtime/node/24.21.0/etc/npmrc
+7 verbose title npm pack
+8 verbose argv "pack" "--cache" "./.npm-cache"
+9 verbose logfile logs-max:10 dir:/home/laix/dsh/dsh-plugin-context/.npm-cache/_logs/2026-09-16T17_56_57_356Z-
+10 verbose logfile /home/laix/dsh/dsh-plugin-context/.npm-cache/_logs/2026-09-16T17_56_57_356Z-debug-0.log
+11 silly logfile done cleaning log files
+12 silly packumentCache heap:4496293888 maxSize:1124073472 maxEntrySize:562036736
+13 notice
+14 notice 📦  dsh-plugin-context@0.1.0
+15 notice Tarball Contents
+16 notice 10.2kB README.md
+16 notice 611B cordis.patch.yml
+16 notice 36.9kB lib/client.js
+16 notice 7.2kB lib/config.js
+16 notice 23.7kB lib/control.js
+16 notice 18.5kB lib/index.js
+16 notice 15.6kB lib/measure.js
+16 notice 11.3kB lib/policies.js
+16 notice 9.3kB lib/snapshot.js
+16 notice 5.8kB lib/surface.js
+16 notice 1.1kB lib/types.js
+16 notice 1.1kB package.json
+17 notice Tarball Details
+18 notice name: dsh-plugin-context
+19 notice version: 0.1.0
+20 notice filename: dsh-plugin-context-0.1.0.tgz
+21 notice package size: 39.5 kB
+22 notice unpacked size: 141.3 kB
+23 notice shasum: fdbc5555b650b48ac6dcfd484c762e09036b6443
+24 notice integrity: sha512-AwUvGwg/7/otV[...]+swhZmvHkY2nA==
+25 notice total files: 12
+26 notice
+27 verbose cwd /home/laix/dsh/dsh-plugin-context
+28 verbose os Linux 6.6.114.1-microsoft-standard-WSL2
+29 verbose node v24.21.0
+30 verbose npm  v11.19.0
+31 verbose exit 0
+32 info ok

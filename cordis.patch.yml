@@ -1,0 +1,12 @@
+# dsh-plugin-context bundle patch: inserts this plugin into a profile's layer
+# stack when the profile lists this package as a bundle (or `dsh plugin
+# --profile <name> add dsh-plugin-context`).
+#
+# No `isolate` realm is needed: this plugin publishes no service. It consumes
+# the host `tools` runtime indirectly through Cordis events, optionally the host
+# `webServer` carrier for its panel routes, and optionally `tokenMeter` /
+# `agents` for measurement — all of which live in the host composition, so it
+# sits loose in the profile.
+- insert:
+    - id: dsh-plugin-context
+      name: 'dsh-plugin-context'

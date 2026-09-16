@@ -1,0 +1,43 @@
+{
+  "name": "dsh-plugin-context",
+  "version": "0.1.1",
+  "description": "Context control for DeepSeek Harness: it measures and can rewrite the toolCall -> toolResult pipeline and every conversation message (over-large tool results, overlong reasoning, overlong output) through pluggable policies that are identity by default, and it ships a stacked, bar-charted monitoring and configuration panel.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "verify": "node scripts/verify-real-session.mjs",
+    "prepare": "npm run build",
+    "verify:live": "node scripts/verify-live.mjs"
+  }
+}
