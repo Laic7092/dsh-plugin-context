@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-context",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "description": "Context control for DeepSeek Harness: it measures and can rewrite the toolCall -> toolResult pipeline and every conversation message (over-large tool results, overlong reasoning, overlong output) through pluggable policies that are identity by default, and it ships a stacked, bar-charted monitoring and configuration panel.",
   "private": true,
   "type": "module",

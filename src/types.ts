@@ -170,6 +170,17 @@ export interface StackNode {
 export interface CallPair {
 	readonly callId: string;
 	readonly toolName: string;
+	/**
+	 * True for a `run_code` SUB-dispatch. The framework logs those two events for
+	 * the log's sake only (`deriveMessages()` ignores them), so a nested call's
+	 * result never reaches the model context — the panel says "log only" rather
+	 * than pricing or flagging it.
+	 */
+	readonly nested: boolean;
+	/** The `run_code` call this ran inside, when it is nested. */
+	readonly parentCallId: string | null;
+	/** True when this call's own result is a node on the current surface. */
+	readonly inContext: boolean;
 	readonly turn: number | null;
 	readonly step: number | null;
 	/** Code points of the serialized arguments. */
@@ -208,15 +219,14 @@ export interface ContextSnapshot {
 		readonly baselineTokens: number;
 		readonly baselineKind: 'none' | 'estimated' | 'usage';
 		readonly nodes: number;
+		/** Root tool calls in the log window. */
+		readonly calls: number;
+		/** `run_code` sub-dispatches in the log window: traffic the context never saw. */
+		readonly subCalls: number;
 	};
 	readonly composition: readonly CompositionBucket[];
 	readonly stack: readonly StackNode[];
 	readonly calls: readonly CallPair[];
-	/** The largest entries, ranked on the host so the panel does not re-sort. */
-	readonly top: {
-		readonly nodes: readonly StackNode[];
-		readonly calls: readonly CallPair[];
-	};
 	readonly interventions: readonly Intervention[];
 	readonly config: ContextConfig;
 	/** Registered policy names, so the panel can say what would run. */

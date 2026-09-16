@@ -81,6 +81,32 @@ export interface NodeIntervention {
 	readonly intervention?: Intervention;
 }
 
+/**
+ * One node's dry run, with the policy's answer still in hand.
+ *
+ * `blocks` is host-side only: it carries references to live content and is never
+ * part of a response body.
+ */
+export interface NodePreview extends NodeIntervention {
+	readonly blocks?: readonly unknown[];
+}
+
+/** One selection's outcome: every row, plus the totals the panel leads with. */
+export interface BatchIntervention {
+	readonly ok: boolean;
+	readonly rows: readonly NodeIntervention[];
+	readonly totals: {
+		readonly nodes: number;
+		readonly changed: number;
+		readonly refused: number;
+		readonly charsBefore: number;
+		readonly charsAfter: number;
+	};
+}
+
+/** How many nodes one batch request may carry. Enforced host-side. */
+export const BATCH_LIMIT = 100;
+
 /** Read a scalar leaf off a live object, or the fallback. */
 function leaf<T>(read: () => T, fallback: T): T {
 	try {
@@ -513,13 +539,16 @@ export class ContextControl {
 	}
 
 	/**
-	 * Run a policy against content that is already in the surface and, if it
-	 * changed anything, commit the replacement.
+	 * Run a policy against content that is already in the surface, WITHOUT
+	 * writing and without logging.
 	 *
-	 * With the shipped identity policy this is a no-op by construction, which is
-	 * exactly right: the mechanism is present and inert until a strategy exists.
+	 * This is the one place a node is read and priced, so both the per-row action
+	 * and the batch preview are the same arithmetic: a preview that could disagree
+	 * with the write it precedes would be worse than no preview at all. The returned
+	 * `blocks` are host-side only — they hold references to live content and must
+	 * never be serialized.
 	 */
-	async interveneOnNode(deps: SurfaceDeps, seq: number, kind: PolicyKind = 'tool-result'): Promise<NodeIntervention> {
+	async previewOnNode(deps: SurfaceDeps, seq: number, kind: PolicyKind = 'tool-result'): Promise<NodePreview> {
 		if (!this.config.enabled) return { ok: false, changed: false, error: 'context control is switched off' };
 		let event: any;
 		let derived: any;
@@ -548,15 +577,87 @@ export class ContextControl {
 			'manual',
 		);
 		const run = await runPolicy(this.policies.get(kind), input, this.now(), false);
-		if (!run.application.changed) {
-			this.interventions.record(run.intervention);
-			return { ok: true, changed: false, intervention: run.intervention };
+		return { ok: true, changed: run.application.changed, intervention: run.intervention, blocks: run.application.blocks };
+	}
+
+	/**
+	 * Run a policy against content that is already in the surface and, if it
+	 * changed anything, commit the replacement.
+	 *
+	 * With the shipped identity policy this is a no-op by construction, which is
+	 * exactly right: the mechanism is present and inert until a strategy exists.
+	 */
+	async interveneOnNode(deps: SurfaceDeps, seq: number, kind: PolicyKind = 'tool-result'): Promise<NodeIntervention> {
+		const preview = await this.previewOnNode(deps, seq, kind);
+		const intervention = preview.intervention;
+		if (intervention === undefined) {
+			return { ok: preview.ok, changed: false, ...(preview.error === undefined ? {} : { error: preview.error }) };
 		}
-		const write: SurfaceWrite = replaceToolResultContent(deps, seq, run.application.blocks);
-		const applied: Intervention = { ...run.intervention, applied: write.ok };
+		if (!preview.changed) {
+			this.interventions.record(intervention);
+			return { ok: true, changed: false, intervention };
+		}
+		const write: SurfaceWrite = replaceToolResultContent(deps, seq, preview.blocks ?? []);
+		const applied: Intervention = { ...intervention, applied: write.ok };
 		this.interventions.record(applied);
 		if (!write.ok) return { ok: false, changed: true, error: write.error, intervention: applied };
 		return { ok: true, changed: true, seq: write.seq, intervention: applied };
+	}
+
+	/**
+	 * Price a whole selection at once, writing nothing and logging nothing.
+	 *
+	 * This is the projection the panel puts above its batch buttons: "these N
+	 * nodes would give back M characters". In `report` posture it is also the whole
+	 * story — the arithmetic is the same one a rewrite would use, and not a byte
+	 * moves.
+	 */
+	async previewNodes(deps: SurfaceDeps, seqs: readonly number[], kind: PolicyKind = 'tool-result'): Promise<BatchIntervention> {
+		return this.runBatch(seqs, (seq) => this.previewOnNode(deps, seq, kind));
+	}
+
+	/** Apply the same policy over a selection, one node at a time. */
+	async interveneOnNodes(deps: SurfaceDeps, seqs: readonly number[], kind: PolicyKind = 'tool-result'): Promise<BatchIntervention> {
+		return this.runBatch(seqs, async (seq) => {
+			const outcome = await this.interveneOnNode(deps, seq, kind);
+			return { ...outcome, blocks: undefined };
+		});
+	}
+
+	/**
+	 * Walk a selection and total it up.
+	 *
+	 * Every row is kept, refusals included: the host refuses a node that is not a
+	 * tool result, one that left the surface, or a write the session rejected, and
+	 * a batch that reported only its successes would be lying about what happened.
+	 * The limit is enforced here rather than trusted from the caller.
+	 */
+	private async runBatch(seqs: readonly number[], run: (seq: number) => Promise<NodePreview>): Promise<BatchIntervention> {
+		const wanted = Array.isArray(seqs) ? seqs.filter((seq) => typeof seq === 'number' && Number.isFinite(seq)).slice(0, BATCH_LIMIT) : [];
+		const rows: NodeIntervention[] = [];
+		let charsBefore = 0;
+		let charsAfter = 0;
+		let changed = 0;
+		let refused = 0;
+		for (const seq of wanted) {
+			const outcome = await run(seq);
+			const intervention = outcome.intervention;
+			rows.push({
+				ok: outcome.ok,
+				changed: outcome.changed,
+				...(outcome.seq === undefined ? {} : { seq: outcome.seq }),
+				...(outcome.error === undefined ? {} : { error: outcome.error }),
+				...(intervention === undefined ? {} : { intervention }),
+			});
+			if (intervention === undefined) {
+				refused += 1;
+				continue;
+			}
+			charsBefore += intervention.charsBefore;
+			charsAfter += intervention.changed ? intervention.charsAfter : intervention.charsBefore;
+			if (outcome.changed) changed += 1;
+		}
+		return { ok: true, rows, totals: { nodes: wanted.length, changed, refused, charsBefore, charsAfter } };
 	}
 
 	/** One line for the boot log, so the active posture is never a mystery. */

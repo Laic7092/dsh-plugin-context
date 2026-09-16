@@ -39,7 +39,7 @@
  *
  * @module dsh-plugin-context
  */
-import { ContextControl } from './control.ts';
+import { BATCH_LIMIT, ContextControl } from './control.ts';
 import { headTailTrim, PolicyRegistry } from './policies.ts';
 
 export const name = 'dsh-plugin-context';
@@ -217,6 +217,26 @@ export function apply(ctx: any, config: any = {}): void {
 		const fail = (res: any, error: unknown) =>
 			send(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
 
+		/**
+		 * Read a node list off a request body.
+		 *
+		 * Duplicates collapse and order is kept: the panel sends what it has
+		 * selected, and running the same node twice would price it twice.
+		 */
+		const seqsOf = (raw: unknown): number[] | null => {
+			if (!Array.isArray(raw) || raw.length === 0) return null;
+			const seqs: number[] = [];
+			const seen = new Set<number>();
+			for (const entry of raw) {
+				if (typeof entry !== 'number' || !Number.isFinite(entry)) continue;
+				const seq = Math.floor(entry);
+				if (seen.has(seq)) continue;
+				seen.add(seq);
+				seqs.push(seq);
+			}
+			return seqs.length === 0 ? null : seqs;
+		};
+
 		/** A bounded body reader: the panel sends a small JSON object and nothing else. */
 		const readBody = (req: any): Promise<{ ok: boolean; value?: any; error?: string }> =>
 			new Promise((resolveBody) => {
@@ -327,6 +347,24 @@ export function apply(ctx: any, config: any = {}): void {
 						if (seq === null) return send(res, 400, { ok: false, error: 'seq is required to intervene on a node' });
 						const outcome = await control.interveneOnNode({ session, tokenMeter: ctx.get('tokenMeter') }, seq);
 						return send(res, outcome.ok ? 200 : 400, { ok: outcome.ok, outcome });
+					}
+
+					// The batch pair: one projection over a whole selection, then the
+					// same run with the writes. Both walk the same per-node path as the
+					// single-node action, so a preview cannot disagree with its apply.
+					if (wanted.action === 'preview' || wanted.action === 'intervene-batch') {
+						const seqs = seqsOf(wanted.seqs);
+						if (seqs === null) {
+							return send(res, 400, { ok: false, error: 'seqs must be a non-empty array of node numbers' });
+						}
+						if (seqs.length > BATCH_LIMIT) {
+							return send(res, 400, { ok: false, error: `a batch may carry at most ${BATCH_LIMIT} nodes` });
+						}
+						const deps = { session, tokenMeter: ctx.get('tokenMeter') };
+						const batch = wanted.action === 'preview'
+							? await control.previewNodes(deps, seqs)
+							: await control.interveneOnNodes(deps, seqs);
+						return send(res, 200, { ok: true, batch, applied: wanted.action === 'intervene-batch' });
 					}
 
 					if (wanted.action === 'prune-official') {

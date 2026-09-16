@@ -101,6 +101,25 @@ export function textOfBlock(block: unknown): string | null {
 	}
 }
 
+/**
+ * The arguments text as the log wrote it.
+ *
+ * The field is a JSON STRING on `tool/call` and on a few old `tool/ptc-dispatch`
+ * events, and a JSON VALUE on the rest — a real log of 324 dispatches held 322
+ * objects and 2 strings. Reading only the string form is how a traffic table ends
+ * up quietly reporting zero argument bytes for every sub-call, so both shapes are
+ * read here, once, and everything downstream sees the same serialized size.
+ */
+export function argsTextOf(value: unknown): string {
+	if (typeof value === 'string') return value;
+	if (value === undefined || value === null) return '';
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return '';
+	}
+}
+
 /** Code points across a content array's text-bearing blocks. */
 export function charsOfContent(blocks: readonly unknown[]): number {
 	let total = 0;
@@ -174,7 +193,7 @@ export function nodeFactsFromEvent(seq: number, event: unknown, toolNames?: Read
 	const blocks: any[] = Array.isArray(message.content) ? message.content : [];
 	const chars = charsOfContent(blocks);
 	if (type === 'system/message') {
-		return { seq, kind: 'system', label: labelOf('system', textOfBlock(blocks[0]) ?? '', 'injected context'), chars, turn, step, toolName: null, callId: null };
+		return { seq, kind: 'system', label: labelOf('system', textOfBlock(blocks[0]) ?? '', 'system prompt'), chars, turn, step, toolName: null, callId: null };
 	}
 	if (type === 'user/message') {
 		return { seq, kind: 'user', label: labelOf('user', textOfBlock(blocks[0]) ?? '', 'user message'), chars, turn, step, toolName: null, callId: null };
@@ -223,7 +242,7 @@ export function callFactsFromEvent(event: unknown): CallFacts | null {
 	const data: any = any.data && typeof any.data === 'object' ? any.data : {};
 	const callId = typeof data.callId === 'string' ? data.callId : null;
 	if (callId === null) return null;
-	const args = typeof data.arguments === 'string' ? data.arguments : '';
+	const args = argsTextOf(data.arguments);
 	return {
 		callId,
 		toolName: typeof data.name === 'string' && data.name.length > 0 ? data.name : 'unknown',
@@ -248,6 +267,132 @@ export function resultFactsFromEvent(seq: number, event: unknown): ResultFacts |
 		seq,
 		chars: charsOfContent(inner),
 		isError: block.isError === true || (data.error !== undefined && data.error !== null),
+	};
+}
+
+/** One nested sub-dispatch as the log recorded it, before start/settle pair up. */
+export interface SubCallEventFacts {
+	readonly subCallId: string;
+	readonly parentCallId: string | null;
+	readonly toolName: string;
+	readonly argsChars: number;
+	readonly contentChars: number;
+	readonly isError: boolean;
+	/** True for the settle event, which is the one that carries the outcome. */
+	readonly settled: boolean;
+	readonly time: number | null;
+	readonly seq: number;
+}
+
+/** One nested sub-dispatch, start and settle joined. */
+export interface SubCallFacts {
+	readonly subCallId: string;
+	/** The `run_code` call the sub-dispatch ran inside. */
+	readonly parentCallId: string | null;
+	readonly toolName: string;
+	readonly argsChars: number;
+	readonly resultChars: number;
+	readonly isError: boolean;
+	/** Wall-clock duration, from the two events' own times. */
+	readonly durationMs: number | null;
+	/** Position in dispatch order, so an unstable sort still has an order. */
+	readonly order: number;
+}
+
+/**
+ * Read a `tool/ptc-dispatch-start` / `tool/ptc-dispatch` event.
+ *
+ * These two events are log-only — the framework's `deriveMessages()` ignores
+ * them, and a sub-call's content therefore never enters the model context — but
+ * they are the only place the log records what actually RAN inside a `run_code`
+ * program, and they carry the dispatched arguments as a JSON string. The runtime
+ * waterfall's own dispatch object carries a name and no arguments; the durable
+ * event carries both. Under the `min-ptc` preset this is the difference between
+ * a tool table that says `run_code` three hundred times and one that says bash,
+ * write and memo.
+ */
+export function subCallFactsFromEvent(seq: number, event: unknown): SubCallEventFacts | null {
+	const any: any = event && typeof event === 'object' ? event : {};
+	const type = typeof any.type === 'string' ? any.type : '';
+	if (type !== 'tool/ptc-dispatch-start' && type !== 'tool/ptc-dispatch') return null;
+	const data: any = any.data && typeof any.data === 'object' ? any.data : {};
+	const subCallId = typeof data.subCallId === 'string' && data.subCallId.length > 0 ? data.subCallId : null;
+	if (subCallId === null) return null;
+	const args = argsTextOf(data.arguments);
+	const content = Array.isArray(data.content) ? data.content : [];
+	return {
+		subCallId,
+		parentCallId: typeof data.parentCallId === 'string' ? data.parentCallId : (typeof data.rootCallId === 'string' ? data.rootCallId : null),
+		toolName: typeof data.name === 'string' && data.name.length > 0 ? data.name : 'unknown',
+		argsChars: countChars(args),
+		contentChars: charsOfContent(content),
+		isError: data.isError === true || (data.error !== undefined && data.error !== null),
+		settled: type === 'tool/ptc-dispatch',
+		time: typeof any.time === 'number' ? any.time : null,
+		seq,
+	};
+}
+
+/**
+ * Join each sub-dispatch's start to its settle.
+ *
+ * A start with no settle is a sub-call that never finished (its parent was
+ * cancelled): it is kept with zero result characters rather than dropped, because
+ * "this call produced nothing" is exactly what a traffic table is for.
+ */
+export function joinSubCalls(events: readonly SubCallEventFacts[]): SubCallFacts[] {
+	const byId = new Map<string, { start: SubCallEventFacts | null; settle: SubCallEventFacts | null; order: number }>();
+	for (const event of events) {
+		const entry = byId.get(event.subCallId) ?? { start: null, settle: null, order: byId.size };
+		if (event.settled) entry.settle = entry.settle === null ? event : entry.settle;
+		else entry.start = entry.start === null ? event : entry.start;
+		byId.set(event.subCallId, entry);
+	}
+	const subs: SubCallFacts[] = [];
+	for (const [subCallId, entry] of byId) {
+		const start = entry.start;
+		const settle = entry.settle;
+		const first = start ?? settle;
+		// A duration needs BOTH ends: a start with no settle is a sub-call that
+		// never finished, and reporting "0 ms" for it would be a measurement of
+		// nothing dressed up as a measurement.
+		const startedAt = start === null ? null : start.time;
+		const endedAt = settle === null ? null : settle.time;
+		subs.push({
+			subCallId,
+			parentCallId: first === null ? null : first.parentCallId,
+			toolName: first === null ? 'unknown' : first.toolName,
+			argsChars: Math.max(start === null ? 0 : start.argsChars, settle === null ? 0 : settle.argsChars),
+			resultChars: settle === null ? 0 : settle.contentChars,
+			isError: settle === null ? false : settle.isError,
+			durationMs: startedAt === null || endedAt === null ? null : Math.max(0, endedAt - startedAt),
+			order: entry.order,
+		});
+	}
+	return subs.sort((a, b) => a.order - b.order);
+}
+
+/**
+ * A sub-dispatch as a panel row: log-only, so never on the surface and never
+ * priced. It inherits its parent `run_code` call's turn and step, because the
+ * dispatch event itself carries neither and "which turn was this" is a filter a
+ * person actually wants.
+ */
+export function subCallPair(sub: SubCallFacts, parent: { turn: number | null; step: number | null } | null = null): CallPair {
+	return {
+		callId: sub.subCallId,
+		toolName: sub.toolName,
+		nested: true,
+		parentCallId: sub.parentCallId,
+		inContext: false,
+		turn: parent === null ? null : parent.turn,
+		step: parent === null ? null : parent.step,
+		argsChars: sub.argsChars,
+		resultChars: sub.resultChars,
+		resultTokens: null,
+		isError: sub.isError,
+		durationMs: sub.durationMs,
+		over: false,
 	};
 }
 
@@ -291,6 +436,9 @@ export function joinCalls(
 		pairs.push({
 			callId: call.callId,
 			toolName: call.toolName,
+			nested: false,
+			parentCallId: null,
+			inContext: result !== undefined,
 			turn: call.turn,
 			step: call.step,
 			argsChars: call.argsChars,
@@ -316,13 +464,33 @@ export function liveCallFacts(live: readonly LiveCall[]): { calls: CallFacts[]; 
 	return { calls, results, durations };
 }
 
-/** The composition buckets, in draw order, from measured nodes. */
+/**
+ * The composition buckets, in draw order.
+ *
+ * `prefix` is what the request carries that no surface node accounts for: the
+ * tool schemas, the request framing, and whatever the meter's per-node prices
+ * left unaccounted for. The system prompt is NOT in here: a system/message event
+ * is a surface node with its own price and its own bucket below. It is derived
+ * by SUBTRACTION, because the measurement's own baseline
+ * is a whole-request anchor (the framework's meter defines
+ * `total = max(0, baseline + surfaceDelta)`), so using it directly as the prefix
+ * would count the entire surface a second time — which is exactly what this panel
+ * did before, and why its legend used to add up to 183%.
+ *
+ * The surface figure is the meter's own when it priced anything, and the sum of
+ * the nodes' own prices otherwise (a meter that is absent or unpriced must not
+ * turn every node into "prefix"). Either way the buckets add up to the total the
+ * panel prints at the top.
+ */
 export function compositionOf(
-	baselineTokens: number,
+	totalTokens: number,
+	surfaceTokens: number,
 	stack: readonly StackNode[],
 ): CompositionBucket[] {
+	const nodeSum = stack.reduce((sum, node) => sum + node.tokens, 0);
+	const surface = surfaceTokens > 0 ? surfaceTokens : nodeSum;
 	const buckets: Record<string, number> = {
-		prefix: baselineTokens,
+		prefix: Math.max(0, totalTokens - surface),
 		system: 0,
 		user: 0,
 		assistant: 0,
@@ -335,12 +503,12 @@ export function compositionOf(
 		buckets[key] = (buckets[key] ?? 0) + node.tokens;
 	}
 	return [
-		{ key: 'prefix', label: 'System prompt & tool schemas', tokens: buckets.prefix },
+		{ key: 'prefix', label: 'Fixed request overhead', tokens: buckets.prefix },
 		{ key: 'tool-result', label: 'Tool results', tokens: buckets['tool-result'] },
 		{ key: 'assistant', label: 'Assistant output', tokens: buckets.assistant },
 		{ key: 'reasoning', label: 'Reasoning (CoT)', tokens: buckets.reasoning },
 		{ key: 'user', label: 'User messages', tokens: buckets.user },
-		{ key: 'system', label: 'Injected context', tokens: buckets.system },
+		{ key: 'system', label: 'System prompt', tokens: buckets.system },
 		{ key: 'other', label: 'Other', tokens: buckets.other },
 	];
 }
@@ -392,14 +560,19 @@ export function buildSnapshot(input: SnapshotInput): ContextSnapshot {
 			baselineTokens,
 			baselineKind: measurement === null ? 'none' : measurement.baselineKind,
 			nodes: input.stack.length,
+			calls: input.calls.filter((call) => !call.nested).length,
+			subCalls: input.calls.filter((call) => call.nested).length,
 		},
-		composition: compositionOf(baselineTokens, input.stack),
+		composition: compositionOf(
+			measurement === null ? 0 : measurement.totalTokens,
+			measurement === null ? 0 : measurement.surfaceTokens,
+			input.stack,
+		),
 		stack: input.stack,
+		// No precomputed ranking is sent: the panel's query sorts and groups, and
+		// shipping a second copy of the same rows for it to ignore would be the
+		// duplication this panel was rebuilt to remove. `topN` is now the page size.
 		calls: input.calls,
-		top: {
-			nodes: rankByTokens(input.stack, input.config.topN),
-			calls: rankCalls(input.calls, input.config.topN),
-		},
 		interventions: input.interventions,
 		config: input.config,
 		policies: input.policies,
@@ -408,17 +581,7 @@ export function buildSnapshot(input: SnapshotInput): ContextSnapshot {
 	};
 }
 
-/** Rank the largest entries of one list, largest first, ties by the given key. */
-export function rankByTokens<T extends { tokens: number }>(items: readonly T[], topN: number): T[] {
-	return [...items].sort((a, b) => b.tokens - a.tokens).slice(0, Math.max(1, topN));
-}
 
-/** Rank call pairs by the bytes they moved through the context. */
-export function rankCalls(calls: readonly CallPair[], topN: number): CallPair[] {
-	return [...calls]
-		.sort((a, b) => b.resultChars + b.argsChars - (a.resultChars + a.argsChars))
-		.slice(0, Math.max(1, topN));
-}
 
 /**
  * A bounded, newest-first log of interventions.

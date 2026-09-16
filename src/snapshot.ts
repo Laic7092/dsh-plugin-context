@@ -24,7 +24,20 @@
  *
  * @module dsh-plugin-context/snapshot
  */
-import { estimateTokens, callFactsFromEvent, charsOfContent, joinCalls, resultFactsFromEvent, nodeFactsFromEvent, type CallFacts, type ResultFacts } from './measure.ts';
+import {
+	estimateTokens,
+	callFactsFromEvent,
+	charsOfContent,
+	joinCalls,
+	joinSubCalls,
+	resultFactsFromEvent,
+	subCallFactsFromEvent,
+	subCallPair,
+	nodeFactsFromEvent,
+	type CallFacts,
+	type ResultFacts,
+	type SubCallEventFacts,
+} from './measure.ts';
 import type { CallPair, ContextConfig, PolicyKind, StackNode } from './types.ts';
 
 /** How many of a session's most recent events the call table walks. */
@@ -110,22 +123,35 @@ export function collectStack(reader: SessionReader, measurement: MeasurementRead
 	return stack;
 }
 
-/** Walk the log window and return every tool call and tool result it holds. */
-export function collectCallFacts(reader: SessionReader): { calls: CallFacts[]; results: ResultFacts[] } {
+/**
+ * Walk the log window once and return every call, result and sub-dispatch.
+ *
+ * The sub-dispatch events are the reason this walks by type rather than by
+ * "is it a call?": under the `min-ptc` preset the only root call is `run_code`,
+ * and what actually ran is recorded solely on the two `tool/ptc-dispatch*`
+ * events.
+ */
+export function collectCallFacts(reader: SessionReader): { calls: CallFacts[]; results: ResultFacts[]; subEvents: SubCallEventFacts[] } {
 	const calls: CallFacts[] = [];
 	const results: ResultFacts[] = [];
+	const subEvents: SubCallEventFacts[] = [];
 	for (const event of reader.recentEvents(LOG_WINDOW)) {
+		const seq = (event as any)?.seq;
+		if (typeof seq !== 'number') continue;
+		const subCall = subCallFactsFromEvent(seq, event);
+		if (subCall !== null) {
+			subEvents.push(subCall);
+			continue;
+		}
 		const call = callFactsFromEvent(event);
 		if (call !== null) {
 			calls.push(call);
 			continue;
 		}
-		const seq = (event as any)?.seq;
-		if (typeof seq !== 'number') continue;
 		const result = resultFactsFromEvent(seq, event);
 		if (result !== null) results.push(result);
 	}
-	return { calls, results };
+	return { calls, results, subEvents };
 }
 
 /** The call pairs the panel ranks, joined and priced. */
@@ -135,14 +161,20 @@ export function collectCalls(
 	config: ContextConfig,
 	durations: ReadonlyMap<string, number> = new Map(),
 ): CallPair[] {
-	const { calls, results } = collectCallFacts(reader);
+	const { calls, results, subEvents } = collectCallFacts(reader);
 	const tokensBySeq = measurement === null ? new Map<number, number>() : measurement.nodes;
 	const overResults = new Set<string>();
 	const budget = config.kinds['tool-result'];
 	if (budget.enabled && budget.maxChars > 0) {
 		for (const result of results) if (result.chars > budget.maxChars) overResults.add(result.callId);
 	}
-	return joinCalls(calls, results, { tokensBySeq, overResults, durations });
+	const pairs = joinCalls(calls, results, { tokensBySeq, overResults, durations });
+	const parents = new Map<string, { turn: number | null; step: number | null }>();
+	for (const call of calls) parents.set(call.callId, { turn: call.turn, step: call.step });
+	for (const sub of joinSubCalls(subEvents)) {
+		pairs.push(subCallPair(sub, sub.parentCallId === null ? null : parents.get(sub.parentCallId) ?? null));
+	}
+	return pairs;
 }
 
 /**

@@ -24,7 +24,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { zstdDecompressSync } from 'node:zlib';
 import { homedir } from 'node:os';
-import { callFactsFromEvent, joinCalls, nodeFactsFromEvent, resultFactsFromEvent, textOfBlock } from '../lib/measure.js';
+import { callFactsFromEvent, joinCalls, joinSubCalls, nodeFactsFromEvent, resultFactsFromEvent, subCallFactsFromEvent, subCallPair, textOfBlock } from '../lib/measure.js';
 
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
 
@@ -115,6 +115,30 @@ if (pairs.length !== callsRead.length) failures.push(`join produced ${pairs.leng
 const unmatched = pairs.filter((pair) => pair.resultChars === 0);
 if (callsRead.length > 0 && unmatched.length === pairs.length) failures.push('no tool result matched its call — call ids do not join');
 
+// The nested half of the traffic: under the `min-ptc` preset the root call is
+// always `run_code`, and the only record of what actually ran is on these two
+// log-only events. This is the check that `name` and `arguments` really exist
+// under those field names — a wrong guess here used to make every row say
+// `run_code` with zero argument bytes, and nothing failed.
+const subEvents = events
+	.filter((event) => event.type === 'tool/ptc-dispatch-start' || event.type === 'tool/ptc-dispatch')
+	.map((event) => subCallFactsFromEvent(event.seq, event));
+const subsRead = subEvents.filter((event) => event !== null);
+if (subsRead.length !== subEvents.length) failures.push(`${subEvents.length - subsRead.length} PTC dispatch event(s) carried no subCallId`);
+const subs = joinSubCalls(subsRead);
+const settled = subsRead.filter((event) => event.settled).length;
+if (settled > 0 && subs.filter((sub) => sub.resultChars > 0).length === 0) {
+	failures.push('no settled sub-dispatch measured any content — the sub-call content shape is wrong');
+}
+const namedSubs = subs.filter((sub) => sub.toolName !== 'unknown');
+if (subs.length > 0 && namedSubs.length === 0) failures.push('every sub-dispatch reported an unknown tool name — the `name` field is wrong');
+const argsRead = subs.filter((sub) => sub.argsChars > 0).length;
+if (subs.length > 0 && argsRead === 0) failures.push('no sub-dispatch reported argument bytes — the `arguments` field is wrong');
+const subPairs = subs.map((sub) => subCallPair(sub));
+if (subPairs.some((pair) => pair.inContext !== false || pair.resultTokens !== null)) {
+	failures.push('a log-only sub-dispatch was treated as context-resident');
+}
+
 // Surface metadata: only the four message-ish types may carry a surface op, and
 // every one of them must.
 const SURFACE = new Set(['system/message', 'user/message', 'assistant/message', 'tool/result']);
@@ -167,6 +191,29 @@ for (const row of toolRows.slice(0, 12)) {
 	console.log(`  ${row.toolName.padEnd(20)} ${String(row.calls).padStart(5)} ${String(row.argsChars).padStart(9)} ${String(row.resultChars).padStart(11)} ${String(row.errors).padStart(8)}`);
 }
 
+// What the panel's "calls" query would actually show, once the nested half is
+// joined in. The two tables are deliberately separate here: only the root call's
+// result is on the surface, and only it can be rewritten.
+const traffic = new Map();
+for (const pair of [...pairs, ...subPairs]) {
+	const row = traffic.get(pair.toolName) ?? { toolName: pair.toolName, calls: 0, argsChars: 0, resultChars: 0, errors: 0, nested: 0 };
+	row.calls += 1;
+	row.argsChars += pair.argsChars;
+	row.resultChars += pair.resultChars;
+	if (pair.isError) row.errors += 1;
+	if (pair.nested) row.nested += 1;
+	traffic.set(pair.toolName, row);
+}
+const trafficRows = [...traffic.values()].sort((a, b) => b.resultChars + b.argsChars - (a.resultChars + a.argsChars));
+console.log(`\nreal traffic, root calls and sub-dispatches together: ${pairs.length + subPairs.length} row(s), ${trafficRows.length} distinct tool name(s)`);
+console.log('  tool                 calls  (nested)  args ch   result ch   errors');
+for (const row of trafficRows.slice(0, 12)) {
+	console.log(`  ${row.toolName.padEnd(20)} ${String(row.calls).padStart(5)} ${String(row.nested).padStart(9)} ${String(row.argsChars).padStart(9)} ${String(row.resultChars).padStart(11)} ${String(row.errors).padStart(8)}`);
+}
+if (subs.length > 0) {
+	console.log(`  sub-dispatch args readable: ${argsRead}/${subs.length}, settled: ${settled}/${subs.length}`);
+}
+
 const largestResults = [...pairs].sort((a, b) => b.resultChars - a.resultChars).slice(0, 8);
 console.log('\n  largest tool results (the tool-result budget question):');
 for (const pair of largestResults) {
@@ -197,4 +244,4 @@ if (failures.length > 0) {
 	for (const failure of [...new Set(failures)]) console.error(`  - ${failure}`);
 	process.exit(1);
 }
-console.log('\nOK: every tool call, tool result, assistant message and surface op in this real log was read the way the plugin assumes.');
+console.log('\nOK: every tool call, sub-dispatch, tool result, assistant message and surface op in this real log was read the way the plugin assumes.');

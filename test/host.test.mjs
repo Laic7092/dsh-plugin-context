@@ -24,6 +24,7 @@ const toolResultEvent = (seq) => ({
 });
 
 function fakeSession(id = 'session-1') {
+	const appended = [];
 	return {
 		id,
 		header: { cwd: '/work' },
@@ -33,7 +34,11 @@ function fakeSession(id = 'session-1') {
 		deriveEventMessage: () => toolResultEvent(7).data.message,
 		snapshotEvents: () => [toolResultEvent(7)],
 		requestContext: () => ({ provider: 'deepseek-official', model: 'deepseek-flash', contextWindow: 128000 }),
-		append: () => ({ seq: 20 }),
+		append: (type, data) => {
+			appended.push({ type, data });
+			return { seq: 20 + appended.length, type };
+		},
+		appended,
 	};
 }
 
@@ -147,7 +152,8 @@ function makeHarness() {
 		const res = fakeRes();
 		return Promise.resolve(handler(req, res)).then(() => res.captured);
 	};
-	return { ctx, listeners, effects, routes, active, call, prunerCalls, services, sessions };
+	const appends = () => [...(sessions.get('session-1')?.appended ?? [])];
+	return { ctx, listeners, effects, routes, active, call, prunerCalls, services, sessions, appends };
 }
 
 test('the plugin identifies itself and needs no hard dependency', () => {
@@ -357,4 +363,95 @@ test('a composition with no token meter still measures what it can, and says wha
 	assert.match(snapshot.measurementError, /token meter is not mounted/);
 	assert.equal(snapshot.totals.tokens, 0);
 	assert.equal(snapshot.stack.length, 1, 'the stack is still listed, priced by the fallback estimate');
+});
+
+test('a batch preview prices a selection, keeps every row, and commits nothing', async () => {
+	const harness = makeHarness();
+	apply(harness.ctx, {
+		kinds: { 'tool-result': { maxChars: 1000, onOver: 'report' } },
+		policies: { 'tool-result': 'head-tail' },
+	});
+	const response = await harness.call('/context/action', {
+		url: '/context/action',
+		method: 'POST',
+		body: { sessionId: 'session-1', action: 'preview', seqs: [7, 7, 999] },
+	});
+	assert.equal(response.status, 200);
+	assert.equal(response.body.applied, false);
+	const batch = response.body.batch;
+	assert.equal(batch.totals.nodes, 2, 'duplicates collapse: pricing the same node twice is a lie');
+	assert.equal(batch.rows.length, 2);
+	assert.equal(batch.rows[0].ok, true);
+	assert.equal(batch.rows[0].intervention.charsBefore, 4000);
+	assert.ok(batch.rows[0].intervention.charsAfter < 4000, 'the head-tail policy would give bytes back');
+	assert.equal(batch.rows[0].changed, true);
+	assert.equal(batch.rows[0].blocks, undefined, 'live content never rides a response body');
+	assert.equal(batch.rows[1].ok, false);
+	assert.match(batch.rows[1].error, /not in this session's surface/);
+	assert.equal(batch.totals.refused, 1, 'a refusal is a row, not a silence');
+	assert.equal(batch.totals.charsAfter, 1000, 'the projection totals what the writes would leave');
+	assert.equal(harness.appends().length, 0, 'a preview is a measurement: nothing is committed');
+});
+
+test('a batch apply writes every node it priced, and reports each row', async () => {
+	const harness = makeHarness();
+	apply(harness.ctx, {
+		kinds: { 'tool-result': { maxChars: 1000, onOver: 'report' } },
+		policies: { 'tool-result': 'head-tail' },
+	});
+	const response = await harness.call('/context/action', {
+		url: '/context/action',
+		method: 'POST',
+		body: { sessionId: 'session-1', action: 'intervene-batch', seqs: [7] },
+	});
+	assert.equal(response.status, 200);
+	assert.equal(response.body.applied, true);
+	assert.equal(response.body.batch.rows[0].intervention.applied, true);
+	assert.ok(harness.appends().length > 0, 'the apply is the half that commits');
+
+	// The preview ran the same arithmetic, so it cannot disagree with the write.
+	const preview = await harness.call('/context/action', {
+		url: '/context/action',
+		method: 'POST',
+		body: { sessionId: 'session-1', action: 'preview', seqs: [7] },
+	});
+	assert.equal(preview.body.batch.rows[0].intervention.charsAfter, response.body.batch.rows[0].intervention.charsAfter);
+});
+
+test('a batch is bounded, and an empty or oversized selection is refused with a reason', async () => {
+	const harness = makeHarness();
+	apply(harness.ctx, {});
+	const empty = await harness.call('/context/action', {
+		url: '/context/action',
+		method: 'POST',
+		body: { sessionId: 'session-1', action: 'preview', seqs: [] },
+	});
+	assert.equal(empty.status, 400);
+	assert.match(empty.body.error, /non-empty array/);
+
+	const tooMany = await harness.call('/context/action', {
+		url: '/context/action',
+		method: 'POST',
+		body: { sessionId: 'session-1', action: 'preview', seqs: Array.from({ length: 101 }, (unused, index) => index + 1) },
+	});
+	assert.equal(tooMany.status, 400);
+	assert.match(tooMany.body.error, /at most 100/);
+});
+
+test('the snapshot carries no precomputed ranking, and its composition is derived', async () => {
+	const harness = makeHarness();
+	apply(harness.ctx, {});
+	const response = await harness.call('/context/state', { url: '/context/state?sessionId=session-1' });
+	const snapshot = response.body.snapshot;
+	assert.equal(snapshot.top, undefined, 'the panel queries; the host does not ship a second copy of the rows');
+	assert.equal(snapshot.totals.calls, 0, 'this stand-in session has no tool calls in its window');
+	assert.equal(snapshot.totals.subCalls, 0);
+	// 9000 measured, 4000 on the surface → 5000 the surface cannot account for.
+	const prefix = snapshot.composition.find((bucket) => bucket.key === 'prefix');
+	assert.equal(prefix.tokens, 5000);
+	assert.equal(
+		snapshot.composition.reduce((sum, bucket) => sum + bucket.tokens, 0),
+		9000,
+		'the buckets add up to the total the header prints',
+	);
 });
